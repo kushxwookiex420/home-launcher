@@ -1,62 +1,83 @@
 # Connecting ChatGPT to the Home bridge
 
-Ten minutes, once. The GPT then runs real actions on the phone and can hand build work to the coding agent.
+About ten minutes, once. After that the GPT can queue actions on the phone, hand build tasks to
+the coding agent, and read the agent's answers and artifacts - without you copying replies.
+
+API version **1.2.0**. Full endpoint reference: [`docs/API.md`](API.md).
 
 ## 1. Create the action
 
 ChatGPT -> **Explore GPTs -> Create** -> **Configure** -> **Actions** -> **Create new action**.
 
-- **Import from URL:** `https://home-bridge-qn2hnd-preview.freebuff.site/openapi.json` (or paste the contents of `bridge/openapi.json`; both are version 1.1.0).
-- **Authentication:** *None*. The pairing code travels as a normal parameter.
+- **Import from URL:** `https://home-bridge-qn2hnd-preview.freebuff.site/openapi.json`
+  (or paste the JSON that URL returns; its source is `bridge/openapi.js`).
+- **Authentication:** *None*. The schema declares the pairing code as a query `apiKey`, so the
+  code travels as an ordinary `code` parameter. A `Bearer` header works too.
 
-Nine operations arrive: `sendToPhone`, `phoneState`, `handTaskToAgent`, `replyToChat`, `readAgentReplies`, `pendingTasks`, `uploadSharedFile`, `listSharedFiles`, `readSharedFile`.
+Eleven operations: `handTaskToAgent`, `taskStatus`, `pendingTasks`, `replyToChat`,
+`readAgentReplies`, `uploadSharedFile`, `listSharedFiles`, `readSharedFile`, `sendToPhone`,
+`phoneState`, `healthCheck`.
 
 ## 2. Instructions
 
-Paste into the GPT's **Instructions** box, filling in the code:
+Paste into the GPT's **Instructions** box, replacing `CODE` with the code shown on the phone:
 
 ```
-You can control the user's Android launcher through the "Home Bridge" action.
-The pairing code is CODE. Always pass it as `code`.
+The Home Bridge action talks to the user's Android launcher and to Buff, their coding agent.
+Every call needs the pairing code CODE, passed as `code`.
 
-Phone control: use sendToPhone with action=status to read the phone, page to switch a tab
-(home|mail|ai|apps|money|ent|control), app with a partial app name, torch on/off, clear to
-reset unread counters, remote with "key|device name", url with an https link. Then use
-phoneState to read what happened. Never claim an action worked until phoneState shows its
-output; the phone only polls while the launcher is on screen.
+Phone control
+- sendToPhone: action=status reads the phone; page switches a tab (home|mail|ai|apps|money|ent|control);
+  app with a partial name opens an app; torch on|off; clear resets unread counters;
+  remote takes "key|device name"; url takes an https link.
+- Read phoneState afterwards. The phone only polls while the launcher is on screen, so online:false
+  means the action is still queued, not that it failed. Never say it worked until phoneState shows
+  status "done" and an output.
 
-Handing work to the coding agent ("buff:"):
-1. Rewrite the request as one precise task sentence.
-2. Call handTaskToAgent with that text and source "chatgpt".
-3. Say it is queued. Never say it is built.
-4. When asked whether it is done, call readAgentReplies and report the newest reply,
-   including any APK link. Use pendingTasks only to check nothing was lost.
+Handing work to Buff
+1. Turn the request into one precise task sentence.
+2. Call handTaskToAgent with text, source "chatgpt" and a short title. Keep the returned taskId.
+3. Say the task is queued with its id. Never say it is built.
+4. When the user asks whether it is done, call taskStatus. queued = not picked up, working = Buff is
+   on it, done = the answer exists. Then call readAgentReplies with that taskId and report the text
+   plus every artifact link.
+5. Use the serverTime from the reply as the next `since` so nothing is read twice.
 
-Files: listSharedFiles / readSharedFile hold the complete source tree (paths like
-app/src/main/java/com/jarvis/launcher/MainActivity.kt) plus specs. The GitHub repo is
-kushxwookiex420/home-launcher, branch main; a commit starting "buff:" is a finished change.
+Project files
+- listSharedFiles shows the shared folder; readSharedFile returns one file's content. Paths look like
+  app/src/main/java/com/jarvis/launcher/MainActivity.kt, docs/API.md, tests/smoke.txt.
+- The GitHub repo kushxwookiex420/home-launcher (branch main) holds docs, config and the worker; a
+  commit message starting "buff:" is a finished change.
 
-Never invent files, versions or links. If something is missing, say so.
+Rules
+- Never invent task ids, versions, file names or links. If a call returns 401, say the pairing code
+  needs updating. If it returns 400, read the error text and fix the request once.
+- Do not try actions outside the seven listed above; anything else is refused on purpose.
 ```
 
 ## 3. Try it
 
-- "check my phone" -> `sendToPhone status`, then `phoneState`.
-- "open the AWS console" -> `sendToPhone url`.
-- "buff: add a stopwatch to CONTROL" -> queued note; ask "did buff finish" later.
+| Say | What happens |
+|---|---|
+| "check my phone" | `sendToPhone status`, then `phoneState` |
+| "open the AWS console" | `sendToPhone url` |
+| "buff: add a stopwatch to CONTROL" | task queued, `taskId` returned |
+| "is buff done?" | `taskStatus`, then `readAgentReplies` |
 
 ## 4. Keep the code private
 
-The pairing code is the only credential. Keep the GPT **private** (or "anyone with a link" only). A public GPT with the code in its instructions lets strangers switch pages and fire `remote` keys on your TV. To revoke, unpair the phone in the launcher and pair again - the old code stops working immediately.
+The pairing code is the only credential. Keep the GPT **private** or link-only: a public GPT with
+the code in its instructions lets strangers switch pages and press `remote` keys on your TV.
+Unpairing the phone in the launcher and pairing again revokes the old code immediately.
 
-## Endpoints
+There is no rate-limit bypass and no way to widen the phone's action list from outside - the
+relay validates, and the phone validates again in `MainActivity.runBridgeCommand`.
 
-| Endpoint | Operation | Use |
-|---|---|---|
-| `POST /send` | `sendToPhone` | queue an action |
-| `GET /state` | `phoneState` | what the phone reported |
-| `POST /note` | `handTaskToAgent` | task for the agent |
-| `GET /notes` | `pendingTasks` | unacknowledged notes |
-| `POST /reply` | `replyToChat` | agent writes the result |
-| `GET /replies` | `readAgentReplies` | read results |
-| `POST /files` / `GET /files` / `GET /file` | `uploadSharedFile` / `listSharedFiles` / `readSharedFile` | shared folder, 200k chars max |
+## 5. If the action reports errors
+
+| Error | Fix |
+|---|---|
+| `401 unauthorized` | The code changed. Update it in the Instructions and try again. |
+| `400 bad_request` | The request body is wrong; the message names the field. |
+| `429 rate_limited` | 20 tasks, 60 replies/uploads or 30 phone commands a minute. Wait. |
+| `404 not_found` | Wrong path name or unknown route. |

@@ -54,11 +54,14 @@ export ANDROID_HOME=<android-sdk>
 
 `StartupTest` (Robolectric) inflates the activity and catches layout regressions. Keep it green.
 
+---
+
 ## The relay
 
 A Worker with a D1 queue. It never executes anything itself — the phone decides, against its own whitelist in `MainActivity.runBridgeCommand`.
 
-Live schema: `https://home-bridge-qn2hnd-preview.freebuff.site/openapi.json`
+Live schema: `https://home-bridge-qn2hnd-preview.freebuff.site/openapi.json` (API 1.2.0).
+Endpoint reference: [`docs/API.md`](docs/API.md). Tests: `node bridge/test/run.mjs`.
 
 | Endpoint | Purpose |
 |---|---|
@@ -67,21 +70,31 @@ Live schema: `https://home-bridge-qn2hnd-preview.freebuff.site/openapi.json`
 | `POST /result` | phone reports what it did |
 | `POST /send` | queue an action: `status`, `page`, `app`, `torch`, `clear`, `remote`, `url` |
 | `GET /state` | recent commands and their output |
-| `POST /note` / `GET /notes` | hand a task to the coding agent |
-| `POST /reply` / `GET /replies` | agent writes the result back |
-| `POST /files` · `GET /files` · `GET /file` | shared folder, text or base64, up to 200k chars |
+| `POST /note` / `GET /notes` / `GET /tasks` | hand a task to the coding agent, list it, read its status |
+| `POST /reply` / `GET /replies` | agent writes the result back, linked to the task, with artifacts |
+| `POST /files` · `GET /files` · `GET /file` | shared folder, text or base64, ≤200k chars, path-checked |
 
-Pairing: the phone shows a 6-character code. It is **never stored in this repo** — it is the only credential. Treat it like a password.
+Every endpoint except `/health`, `/openapi.json` and the phone's `/bridge` `/poll` `/result`
+requires the pairing code (body, query or `Authorization: Bearer`) and answers `401` without it.
+
+Pairing: the phone shows a 6-character code. It is **never stored in this repo** — it is the
+only credential. Treat it like a password.
 
 ## BUFF PROTOCOL (for an assistant using this repo)
 
 If the user says **"talk to buff"**, **"ask buff"**, or **"buff: …"**:
 
 1. Turn the request into one precise task sentence.
-2. `handTaskToAgent` (`POST /note`) with `{code, text, source: "chatgpt"}`.
+2. `handTaskToAgent` (`POST /note`) with `{code, text, source: "chatgpt"}`; keep the `taskId`.
 3. Tell the user it is queued. **Never claim it is built.**
-4. When the user asks whether Buff finished, call `readAgentReplies` (`GET /replies`) and report the newest reply, including any APK link.
+4. When the user asks whether Buff finished, call `taskStatus` (`GET /tasks`) for
+   queued/working/done, then `readAgentReplies` (`GET /replies?taskId=…`) and report the
+   reply text plus every artifact link.
 
-Reading the project: browse this repo for code, and `readSharedFile` for specs and patches the agent leaves behind. The agent commits here, so a commit message beginning `buff:` is a finished change.
+Reading the project: browse this repo for code, and `readSharedFile` for specs and patches the
+agent leaves behind. The agent commits here, so a commit message beginning `buff:` is a
+finished change.
 
-What the agent can do: edit this project, build APKs, deploy the relay, upload files to the shared folder. What it cannot do: act while no chat turn is open, send messages or place calls on the phone, or read private content.
+What the agent can do: edit this project, build APKs, deploy the relay, upload files to the
+shared folder. What it cannot do: act while no chat turn is open, send messages or place calls
+on the phone, or read private content.
