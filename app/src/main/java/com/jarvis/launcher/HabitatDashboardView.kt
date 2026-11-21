@@ -53,6 +53,7 @@ class HabitatDashboardView @JvmOverloads constructor(
 
     private var section = Section.AX
     private var payload: JSONObject? = null
+    private var lastRefreshFailed = false
     private var expanded: Boolean
         get() = prefs.getBoolean("habitat_expanded", false)
         set(value) {
@@ -208,12 +209,14 @@ class HabitatDashboardView @JvmOverloads constructor(
                 ticking = false
                 outcome.onSuccess {
                     payload = it
+                    lastRefreshFailed = false
                     binding.habitatError.visibility = View.GONE
                     paintChrome()
                     renderSection()
                     HabitatNotifier.onSync(context, it)
                 }.onFailure {
-                    payload = null
+                    // Keep the last successful payload visible; paintChrome marks it stale/offline.
+                    lastRefreshFailed = true
                     paintChrome()
                     renderSection()
                     flash(it.message ?: str(R.string.habitat_unreachable), soft = false)
@@ -228,7 +231,7 @@ class HabitatDashboardView @JvmOverloads constructor(
         val data = payload
         val linked = HabitatClient.isLinked(context)
         val health = data?.optJSONObject("relay")?.optString("health").orEmpty()
-        val online = health == "ok"
+        val online = !lastRefreshFailed && health == "ok"
         binding.habitatChip.setText(
             when {
                 !linked -> R.string.habitat_offline_chip
@@ -243,6 +246,7 @@ class HabitatDashboardView @JvmOverloads constructor(
         // never synced. Nothing is shown as current unless the last call succeeded.
         val syncLine = when {
             !linked -> str(R.string.habitat_not_linked) + " · ID " + shortId()
+            lastRefreshFailed && last > 0 -> str(R.string.habitat_last_sync_failed, stamp.format(Date(last)))
             data != null && last > 0 -> str(R.string.habitat_synced) + " " + stamp.format(Date(last))
             data == null && last > 0 -> str(R.string.habitat_last_sync_failed, stamp.format(Date(last)))
             else -> str(R.string.habitat_not_synced)
