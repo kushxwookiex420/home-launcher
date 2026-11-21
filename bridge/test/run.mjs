@@ -256,14 +256,142 @@ await test("unknown routes are 404", async () => {
 await test("the OpenAPI document describes every operation", async () => {
   const { status, data } = await get("/openapi.json");
   assert.equal(status, 200);
-  assert.equal(data.info.version, "1.2.0");
+  assert.equal(data.info.version, "1.3.0");
   const ops = Object.values(data.paths).flatMap((path) => Object.values(path).map((op) => op.operationId));
-  for (const id of ["handTaskToAgent", "readAgentReplies", "taskStatus", "pendingTasks", "uploadSharedFile", "listSharedFiles", "readSharedFile", "sendToPhone", "phoneState"]) {
+  for (const id of ["handTaskToAgent", "readAgentReplies", "taskStatus", "pendingTasks", "uploadSharedFile", "listSharedFiles", "readSharedFile", "sendToPhone", "phoneState", "mintCredential", "listCredentials", "revokeCredential"]) {
     assert.ok(ops.includes(id), `missing ${id}`);
   }
   assert.ok(data.components.securitySchemes.pairingCode);
   assert.ok(!JSON.stringify(data.paths).includes("$ref"), "served schema must be inlined for ChatGPT");
   assert.ok(data.paths["/note"].post.responses["401"]);
+});
+
+
+// ---- credential roles -------------------------------------------------------
+
+let axToken = null;
+let buffToken = null;
+let buffKeyId = null;
+
+await test("owner can mint separate ax and buff credentials", async () => {
+  const ax = await post("/keys", { code, role: "ax", label: "chatgpt", ttlDays: 30 });
+  assert.equal(ax.status, 200);
+  assert.match(ax.data.token, /^hb_ax_[0-9a-f]{48}$/);
+  assert.ok(ax.data.expiresAt > Date.now());
+  const buff = await post("/keys", { code, role: "buff", label: "agent" });
+  assert.equal(buff.status, 200);
+  assert.match(buff.data.token, /^hb_buff_[0-9a-f]{48}$/);
+  assert.equal(buff.data.expiresAt, null);
+  axToken = ax.data.token;
+  buffToken = buff.data.token;
+  buffKeyId = buff.data.id;
+});
+
+await test("the credential list hides the tokens", async () => {
+  const { status, data } = await get(`/keys?code=${code}`);
+  assert.equal(status, 200);
+  assert.equal(data.count, 2);
+  assert.equal(JSON.stringify(data).includes(axToken), false);
+  assert.ok(data.keys.every((k) => k.id && k.role && k.prefix && k.active === true));
+});
+
+await test("a role credential cannot mint or list credentials", async () => {
+  const mint = await post("/keys", { role: "ax" }, { authorization: `Bearer ${axToken}` });
+  assert.equal(mint.status, 403);
+  const list = await get("/keys", { authorization: `Bearer ${axToken}` });
+  assert.equal(list.status, 403);
+  const revoke = await post("/keys/revoke", { id: buffKeyId }, { authorization: `Bearer ${buffToken}` });
+  assert.equal(revoke.status, 403);
+});
+
+await test("ax can submit a task and read its status", async () => {
+  const note = await post("/note", { text: "ax role: add a timer", title: "timer", source: "chatgpt" }, { authorization: `Bearer ${axToken}` });
+  assert.equal(note.status, 200);
+  assert.ok(note.data.taskId);
+  const tasks = await get("/tasks", { authorization: `Bearer ${axToken}` });
+  assert.equal(tasks.status, 200);
+  assert.ok(tasks.data.tasks.some((t) => t.id === note.data.taskId));
+});
+
+await test("ax cannot reply, upload, claim tasks or read the queue", async () => {
+  const auth = { authorization: `Bearer ${axToken}` };
+  assert.equal((await post("/reply", { text: "nope" }, auth)).status, 403);
+  assert.equal((await post("/files", { name: "x/y.md", content: "x" }, auth)).status, 403);
+  assert.equal((await post("/notes/ack", { ids: ["x"] }, auth)).status, 403);
+  assert.equal((await get("/notes", auth)).status, 403);
+});
+
+await test("ax can queue an approved phone action and read phone state", async () => {
+  const send = await post("/send", { action: "torch", arg: "on" }, { authorization: `Bearer ${axToken}` });
+  assert.equal(send.status, 200);
+  assert.ok(send.data.id);
+  const state = await get("/state", { authorization: `Bearer ${axToken}` });
+  assert.equal(state.status, 200);
+  assert.equal(state.data.commands[0].action, "torch");
+  assert.equal((await post("/send", { action: "shell", arg: "id" }, { authorization: `Bearer ${axToken}` })).status, 400);
+});
+
+await test("buff can claim tasks, reply and upload artifacts", async () => {
+  const auth = { authorization: `Bearer ${buffToken}` };
+  const queue = await get("/notes", auth);
+  assert.equal(queue.status, 200);
+  const taskId = queue.data.tasks[0].id;
+  const ack = await post("/notes/ack", { ids: [taskId] }, auth);
+  assert.equal(ack.status, 200);
+  const reply = await post("/reply", { taskId, text: "timer built", artifacts: ["https://files.catbox.moe/x.apk"] }, auth);
+  assert.equal(reply.status, 200);
+  const files = await post("/files", { name: "reports/timer.md", content: "# timer" }, auth);
+  assert.equal(files.status, 200);
+  const read = await get("/file?name=reports/timer.md", auth);
+  assert.equal(read.status, 200);
+  assert.equal(read.data.data, "# timer");
+  const done = await get(`/tasks?limit=5`, auth);
+  assert.equal(done.data.tasks.find((t) => t.id === taskId).status, "done");
+});
+
+await test("buff cannot submit tasks, queue phone commands or read phone state", async () => {
+  const auth = { authorization: `Bearer ${buffToken}` };
+  assert.equal((await post("/note", { text: "impersonation" }, auth)).status, 403);
+  assert.equal((await post("/send", { action: "torch", arg: "on" }, auth)).status, 403);
+  assert.equal((await get("/state", auth)).status, 403);
+});
+
+await test("a revoked credential stops working immediately", async () => {
+  const fresh = (await post("/keys", { code, role: "buff", label: "rotate-me" })).data;
+  const before = await get("/notes", { authorization: `Bearer ${fresh.token}` });
+  assert.equal(before.status, 200);
+  assert.equal((await post("/keys/revoke", { code, id: fresh.id })).status, 200);
+  const after = await get("/notes", { authorization: `Bearer ${fresh.token}` });
+  assert.equal(after.status, 401);
+  assert.equal(after.data.code, "unauthorized");
+});
+
+await test("an expired credential is refused", async () => {
+  const expired = "hb_ax_" + "a".repeat(48);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(expired));
+  const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await env.DB.prepare(
+    "INSERT INTO keys (id, bridge_id, role, label, hash, prefix, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind("expired-key", deviceId, "ax", "expired", hash, expired.slice(0, 12), Date.now() - 10000, Date.now() - 1000).run();
+  const res = await get("/tasks", { authorization: `Bearer ${expired}` });
+  assert.equal(res.status, 401);
+  assert.match(res.data.error, /expired/);
+});
+
+await test("a credential is bound to its own phone", async () => {
+  const other = (await post("/bridge", { name: "second phone" })).data;
+  const otherKey = (await post("/keys", { code: other.code, role: "ax", label: "other" })).data;
+  const files = await get("/files", { authorization: `Bearer ${otherKey.token}` });
+  assert.equal(files.status, 200);
+  assert.equal(files.data.count, 0);
+  const thisFiles = await get(`/files?code=${code}`);
+  assert.ok(thisFiles.data.count > 0);
+});
+
+await test("unknown and malformed tokens are refused", async () => {
+  assert.equal((await get("/tasks", { authorization: "Bearer hb_ax_" + "f".repeat(48) })).status, 401);
+  assert.equal((await get("/tasks", { authorization: "Bearer not-a-token" })).status, 401);
+  assert.equal((await get("/tasks")).status, 401);
 });
 
 // ---------------------------------------------------------------------------
