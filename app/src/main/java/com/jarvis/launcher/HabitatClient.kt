@@ -78,7 +78,17 @@ object HabitatClient {
             }
         }
         if (issued.isBlank()) throw Failure("Habitat did not return a device token.")
-        prefs(context).edit().putString(KEY_TOKEN, issued).apply()
+
+        // Do not persist or report a linked state until this exact device token has
+        // successfully authenticated against the protected dashboard endpoint.
+        val heartbeatPath = "/device/habitat?deviceId=" +
+            URLEncoder.encode(deviceId, "UTF-8")
+        request(context, "GET", heartbeatPath, null, issued)
+
+        prefs(context).edit()
+            .putString(KEY_TOKEN, issued)
+            .putLong(KEY_SYNC, System.currentTimeMillis())
+            .apply()
         return reply
     }
 
