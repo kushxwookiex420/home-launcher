@@ -262,6 +262,7 @@ await test("the OpenAPI document describes every operation", async () => {
     assert.ok(ops.includes(id), `missing ${id}`);
   }
   assert.ok(data.components.securitySchemes.pairingCode);
+  assert.ok(!JSON.stringify(data.paths).includes("$ref"), "served schema must be inlined for ChatGPT");
   assert.ok(data.paths["/note"].post.responses["401"]);
 });
 

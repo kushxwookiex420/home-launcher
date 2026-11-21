@@ -7,7 +7,7 @@ const errResponse = (description) => ({
   content: { "application/json": { schema: errRef } }
 });
 
-export const OPENAPI = {
+const RAW = {
   openapi: "3.1.0",
   info: {
     title: "Home Bridge",
@@ -468,3 +468,30 @@ export const OPENAPI = {
     }
   }
 };
+
+/**
+ * Returns the document with every local $ref expanded. ChatGPT's action importer is happiest with
+ * a flat schema, so /openapi.json serves this while the source above stays readable.
+ */
+export function inlineSchema(doc) {
+  const seen = new Set();
+  const resolve = (node, depth = 0) => {
+    if (node === null || typeof node !== "object" || depth > 60) return node;
+    if (Array.isArray(node)) return node.map((item) => resolve(item, depth + 1));
+    if (typeof node.$ref === "string" && node.$ref.startsWith("#/")) {
+      if (seen.has(node.$ref)) return {};
+      seen.add(node.$ref);
+      const target = node.$ref.slice(2).split("/").reduce((acc, key) => (acc ? acc[key] : undefined), doc);
+      const expanded = target ? resolve(target, depth + 1) : {};
+      seen.delete(node.$ref);
+      return expanded;
+    }
+    const out = {};
+    for (const [key, value] of Object.entries(node)) out[key] = resolve(value, depth + 1);
+    return out;
+  };
+  return resolve(doc);
+}
+
+// Served to ChatGPT fully expanded: its action importer is happiest with a flat schema.
+export const OPENAPI = inlineSchema(RAW);
