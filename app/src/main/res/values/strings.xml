@@ -188,4 +188,10 @@
     <string name="habitat_backend">HABITAT</string>
     <string name="habitat_providers">PROVIDERS</string>
     <string name="habitat_github_off">GITHUB UNAVAILABLE · </string>
+    <string name="habitat_last_sync_failed">OFFLINE · LAST SYNC %1$s</string>
+    <string name="habitat_notify">NOTIFICATIONS</string>
+    <string name="habitat_notify_on">ON</string>
+    <string name="habitat_notify_blocked">BLOCKED — ALLOW IN SYSTEM SETTINGS</string>
+    <string name="habitat_channel_name">Habitat status</string>
+    <string name="habitat_channel_desc">Task and phone command results reported by Habitat</string>
 </resources>
