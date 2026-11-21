@@ -1,12 +1,20 @@
-// Freebuff bridge relay: the phone polls for commands, whoever holds the pairing code queues them
-// and hands tasks to the coding agent. Nothing here executes anything on the phone — the launcher
-// decides, against its own whitelist in MainActivity.runBridgeCommand.
+// Freebuff bridge relay: the phone polls for commands, assistant and agent credentials queue them
+// and hand tasks across. Nothing here executes anything on the phone — the launcher decides,
+// against its own whitelist in MainActivity.runBridgeCommand.
+//
+// Credentials:
+//   hb_ax_…    Ax role: submit tasks, read replies/status, read files, queue approved phone actions
+//   hb_buff_…  Buff role: claim tasks, reply, upload/update artifacts, read files
+//   code       owner: the phone pairing code, still accepted for the installed APK and for key
+//              management. Never stored in this repo.
+// Every token is stored only as a SHA-256 hash; the plaintext is shown once at creation.
 
 import { OPENAPI } from "./openapi.js";
 
 const JSON_HEAD = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_FILE_CHARS = 200000;
 const CODE_RE = /^[A-Z0-9]{6}$/;
+const TOKEN_RE = /^hb_(ax|buff)_[0-9a-f]{48}$/;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEAD });
@@ -18,8 +26,8 @@ function fail(status, message, code) {
 
 function httpCode(status) {
   return (
-    { 400: "bad_request", 401: "unauthorized", 404: "not_found", 405: "method_not_allowed",
-      413: "too_large", 429: "rate_limited" }[status] || "error"
+    { 400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+      405: "method_not_allowed", 413: "too_large", 429: "rate_limited" }[status] || "error"
   );
 }
 
@@ -29,6 +37,12 @@ function code6() {
   const bytes = crypto.getRandomValues(new Uint8Array(6));
   for (const b of bytes) out += alphabet[b % alphabet.length];
   return out;
+}
+
+function token(role) {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `hb_${role}_${hex}`;
 }
 
 const newId = () => crypto.randomUUID();
@@ -134,6 +148,18 @@ const DDL = [
      window INTEGER NOT NULL,
      count INTEGER NOT NULL,
      PRIMARY KEY (bridge_id, key)
+   )`,
+  `CREATE TABLE IF NOT EXISTS keys (
+     id TEXT PRIMARY KEY,
+     bridge_id TEXT NOT NULL,
+     role TEXT NOT NULL,
+     label TEXT,
+     hash TEXT NOT NULL UNIQUE,
+     prefix TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     expires_at INTEGER,
+     revoked_at INTEGER,
+     last_used INTEGER
    )`
 ];
 
@@ -182,37 +208,81 @@ async function readBody(request) {
   }
 }
 
-/** Resolves the device from the body, the query string or an Authorization: Bearer header. */
-async function authDevice(request, env, url, body) {
+/**
+ * Resolves the caller. A Bearer token picks the role from the keys table; the pairing code (Bearer,
+ * body or query, for the installed phone app) resolves to the owner role.
+ */
+async function authenticate(request, env, url, body) {
   const header = request.headers.get("authorization") || "";
   const bearer = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
-  const raw = body.code || url.searchParams.get("code") || bearer;
-  if (!raw) return { error: fail(401, "pairing code required") };
+  const now = Date.now();
+
+  if (TOKEN_RE.test(bearer)) {
+    const hash = await sha256(bearer);
+    const row = await env.DB.prepare(
+      "SELECT id, bridge_id, role, label, expires_at, revoked_at, last_used FROM keys WHERE hash = ?"
+    ).bind(hash).first();
+    if (!row) return { error: fail(401, "unknown credential") };
+    if (row.revoked_at) return { error: fail(401, "credential revoked") };
+    if (row.expires_at && now > row.expires_at) return { error: fail(401, "credential expired") };
+    const device = await env.DB.prepare("SELECT id, code, name, last_seen FROM bridges WHERE id = ?")
+      .bind(row.bridge_id)
+      .first();
+    if (!device) return { error: fail(401, "credential is not attached to a phone") };
+    if (!row.last_used || now - row.last_used > 60000) {
+      await env.DB.prepare("UPDATE keys SET last_used = ? WHERE id = ?").bind(now, row.id).run();
+    }
+    return {
+      principal: {
+        role: row.role,
+        device,
+        deviceId: device.id,
+        keyId: row.id,
+        label: row.label,
+        rateKey: `k:${row.id}`
+      }
+    };
+  }
+
+  if (bearer && !CODE_RE.test(bearer.toUpperCase())) {
+    return { error: fail(401, "unrecognized credential format") };
+  }
+
+  const raw = bearer || body.code || url.searchParams.get("code");
+  if (!raw) return { error: fail(401, "credential required") };
   const code = String(raw).trim().toUpperCase();
   if (!CODE_RE.test(code)) return { error: fail(401, "malformed pairing code") };
-  const row = await env.DB.prepare("SELECT id, code, name, last_seen FROM bridges WHERE code = ?")
+  const device = await env.DB.prepare("SELECT id, code, name, last_seen FROM bridges WHERE code = ?")
     .bind(code)
     .first();
-  if (!row || !ctEqual(row.code, code)) return { error: fail(401, "unknown pairing code") };
-  return { device: row, code };
+  if (!device || !ctEqual(device.code, code)) return { error: fail(401, "unknown pairing code") };
+  return { principal: { role: "owner", device, deviceId: device.id, keyId: null, rateKey: `c:${device.id}` } };
 }
 
-async function withinLimit(db, bridgeId, key, limit, windowMs, at) {
+function allowed(principal, roles) {
+  return principal.role === "owner" || roles.includes(principal.role);
+}
+
+function forbidden(principal, why) {
+  return fail(403, `${why} (credential role: ${principal.role})`, "forbidden");
+}
+
+async function withinLimit(db, rateKey, key, limit, windowMs, at) {
   const row = await db
     .prepare("SELECT window, count FROM hits WHERE bridge_id = ? AND key = ?")
-    .bind(bridgeId, key)
+    .bind(rateKey, key)
     .first();
   if (!row || at - row.window >= windowMs) {
     await db
       .prepare("INSERT INTO hits (bridge_id, key, window, count) VALUES (?, ?, ?, 1) ON CONFLICT(bridge_id, key) DO UPDATE SET window = ?, count = 1")
-      .bind(bridgeId, key, at, at)
+      .bind(rateKey, key, at, at)
       .run();
     return true;
   }
   if (row.count >= limit) return false;
   await db
     .prepare("UPDATE hits SET count = count + 1 WHERE bridge_id = ? AND key = ?")
-    .bind(bridgeId, key)
+    .bind(rateKey, key)
     .run();
   return true;
 }
@@ -322,24 +392,89 @@ async function handle(request, env) {
 
   // ---- authenticated endpoints ----
 
-  const auth = await authDevice(request, env, url, parsed.body);
+  const auth = await authenticate(request, env, url, parsed.body);
   if (auth.error) return auth.error;
-  const device = auth.device;
+  const principal = auth.principal;
+  const device = principal.device;
+
+  if (method === "POST" && path === "/keys") {
+    if (principal.role !== "owner") return forbidden(principal, "only the owner pairing code may mint credentials");
+    const body = parsed.body;
+    const role = cleanStr(body.role, 10).toLowerCase();
+    if (role !== "ax" && role !== "buff") return fail(400, "role must be ax or buff");
+    const ttlDays = Number(body.ttlDays || 0);
+    if (ttlDays && (ttlDays < 1 || ttlDays > 365)) return fail(400, "ttlDays must be between 1 and 365");
+    if (!(await withinLimit(db, `c:${device.id}`, "keys", 10, 60000, now))) return fail(429, "rate limited");
+    const plaintext = token(role);
+    const hash = await sha256(plaintext);
+    const keyId = newId();
+    const expiresAt = ttlDays ? now + ttlDays * 86400000 : null;
+    await db
+      .prepare("INSERT INTO keys (id, bridge_id, role, label, hash, prefix, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(keyId, device.id, role, cleanStr(body.label, 60) || role, hash, plaintext.slice(0, 12), now, expiresAt)
+      .run();
+    return json({
+      ok: true,
+      id: keyId,
+      role,
+      label: cleanStr(body.label, 60) || role,
+      token: plaintext,
+      createdAt: now,
+      expiresAt,
+      note: "Store this token now. Only its hash is kept; it cannot be read again."
+    });
+  }
+
+  if (method === "GET" && path === "/keys") {
+    if (principal.role !== "owner") return forbidden(principal, "only the owner pairing code may list credentials");
+    const rows = await db
+      .prepare("SELECT id, role, label, prefix, created_at, expires_at, revoked_at, last_used FROM keys WHERE bridge_id = ? ORDER BY created_at DESC")
+      .bind(device.id)
+      .all();
+    return json({
+      ok: true,
+      count: (rows.results || []).length,
+      keys: (rows.results || []).map((row) => ({
+        id: row.id,
+        role: row.role,
+        label: row.label,
+        prefix: row.prefix,
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        revokedAt: row.revoked_at,
+        lastUsed: row.last_used,
+        active: !row.revoked_at && (!row.expires_at || now <= row.expires_at)
+      }))
+    });
+  }
+
+  if (method === "POST" && path === "/keys/revoke") {
+    if (principal.role !== "owner") return forbidden(principal, "only the owner pairing code may revoke credentials");
+    const body = parsed.body;
+    const keyId = cleanStr(body.id, 60);
+    if (!keyId) return fail(400, "id required");
+    const row = await db.prepare("SELECT id FROM keys WHERE id = ? AND bridge_id = ?").bind(keyId, device.id).first();
+    if (!row) return fail(404, "no such credential");
+    await db.prepare("UPDATE keys SET revoked_at = ? WHERE id = ?").bind(now, keyId).run();
+    return json({ ok: true, id: keyId, revokedAt: now });
+  }
 
   if (method === "POST" && path === "/note") {
+    if (!allowed(principal, ["ax"])) return forbidden(principal, "only an ax credential may submit tasks");
     const body = parsed.body;
     const text = cleanStr(body.text, 4000);
     if (!text) return fail(400, "text required");
-    if (!(await withinLimit(db, device.id, "note", 20, 60000, now))) return fail(429, "more than 20 tasks a minute");
+    if (!(await withinLimit(db, principal.rateKey, "note", 20, 60000, now))) return fail(429, "more than 20 tasks a minute");
     const taskId = newId();
     await db
       .prepare("INSERT INTO notes (id, bridge_id, source, text, ack, created_at, done, title) VALUES (?, ?, ?, ?, 0, ?, 0, ?)")
-      .bind(taskId, device.id, cleanStr(body.source, 40) || "chatgpt", text, now, cleanStr(body.title, 120) || null)
+      .bind(taskId, device.id, cleanStr(body.source, 40) || "ax", text, now, cleanStr(body.title, 120) || null)
       .run();
     return json({ ok: true, taskId, createdAt: now, iso: iso(now) });
   }
 
   if (method === "GET" && path === "/notes") {
+    if (!allowed(principal, ["buff"])) return forbidden(principal, "only a buff credential may read the task queue");
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
     const rows = await db
       .prepare("SELECT id, source, text, title, ack, done, created_at FROM notes WHERE bridge_id = ? AND ack = 0 ORDER BY created_at LIMIT ?")
@@ -359,6 +494,7 @@ async function handle(request, env) {
   }
 
   if (method === "POST" && path === "/notes/ack") {
+    if (!allowed(principal, ["buff"])) return forbidden(principal, "only a buff credential may claim tasks");
     const body = parsed.body;
     const ids = Array.isArray(body.ids) ? body.ids.map((id) => cleanStr(id, 60)).filter(Boolean).slice(0, 50) : [];
     if (ids.length) {
@@ -372,6 +508,7 @@ async function handle(request, env) {
   }
 
   if (method === "GET" && path === "/tasks") {
+    if (!allowed(principal, ["ax", "buff"])) return forbidden(principal, "this credential may not read task status");
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
     const rows = await db
       .prepare(
@@ -400,6 +537,7 @@ async function handle(request, env) {
   }
 
   if (method === "POST" && path === "/reply") {
+    if (!allowed(principal, ["buff"])) return forbidden(principal, "only a buff credential may post replies");
     const body = parsed.body;
     const text = cleanStr(body.text, 4000);
     if (!text) return fail(400, "text required");
@@ -419,11 +557,11 @@ async function handle(request, env) {
       if (!/^https?:\/\//i.test(link)) return fail(400, "artifacts must be http(s) links");
       cleanArtifacts.push(link);
     }
-    if (!(await withinLimit(db, device.id, "reply", 60, 60000, now))) return fail(429, "rate limited");
+    if (!(await withinLimit(db, principal.rateKey, "reply", 60, 60000, now))) return fail(429, "rate limited");
     const replyId = newId();
     await db
       .prepare("INSERT INTO replies (id, bridge_id, source, text, created_at, task_id, artifacts) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(replyId, device.id, cleanStr(body.source, 40) || "freebuff", text, now, taskId || null, JSON.stringify(cleanArtifacts))
+      .bind(replyId, device.id, cleanStr(body.source, 40) || "buff", text, now, taskId || null, JSON.stringify(cleanArtifacts))
       .run();
     if (taskId) {
       await db.prepare("UPDATE notes SET ack = 1, done = 1 WHERE bridge_id = ? AND id = ?").bind(device.id, taskId).run();
@@ -432,6 +570,7 @@ async function handle(request, env) {
   }
 
   if (method === "GET" && path === "/replies") {
+    if (!allowed(principal, ["ax", "buff"])) return forbidden(principal, "this credential may not read replies");
     const since = Number(url.searchParams.get("since") || 0) || 0;
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
     const taskId = cleanStr(url.searchParams.get("taskId"), 60);
@@ -458,6 +597,7 @@ async function handle(request, env) {
   }
 
   if (method === "POST" && path === "/files") {
+    if (!allowed(principal, ["buff"])) return forbidden(principal, "only a buff credential may upload shared files");
     const body = parsed.body;
     const nameProblem = badFileName(body.name);
     if (nameProblem) return fail(400, nameProblem);
@@ -466,7 +606,7 @@ async function handle(request, env) {
     const content = body.content;
     if (!content.length) return fail(400, "content required");
     if (content.length > MAX_FILE_CHARS) return fail(413, `file too large (${MAX_FILE_CHARS} characters)`);
-    if (!(await withinLimit(db, device.id, "files", 60, 60000, now))) return fail(429, "rate limited");
+    if (!(await withinLimit(db, principal.rateKey, "files", 60, 60000, now))) return fail(429, "rate limited");
     const encoding = body.encoding === "base64" ? "base64" : "text";
     const bytes = new TextEncoder().encode(content).length;
     const hash = await sha256(content);
@@ -479,6 +619,7 @@ async function handle(request, env) {
   }
 
   if (method === "GET" && path === "/files") {
+    if (!allowed(principal, ["ax", "buff"])) return forbidden(principal, "this credential may not read shared files");
     const rows = await db
       .prepare("SELECT name, mime, encoding, length(data) AS size, created_at FROM files WHERE bridge_id = ? ORDER BY created_at DESC")
       .bind(device.id)
@@ -496,6 +637,7 @@ async function handle(request, env) {
   }
 
   if (method === "GET" && path === "/file") {
+    if (!allowed(principal, ["ax", "buff"])) return forbidden(principal, "this credential may not read shared files");
     const rawName = url.searchParams.get("name");
     const nameProblem = badFileName(rawName);
     if (nameProblem) return fail(400, nameProblem);
@@ -517,6 +659,7 @@ async function handle(request, env) {
   }
 
   if (method === "POST" && path === "/send") {
+    if (!allowed(principal, ["ax"])) return forbidden(principal, "only an ax credential may queue phone commands");
     const body = parsed.body;
     const action = cleanStr(body.action, 40);
     const spec = ACTIONS[action];
@@ -532,7 +675,7 @@ async function handle(request, env) {
       if (action === "url" && !/^https:\/\//i.test(arg)) return fail(400, "url must start with https://");
       if (action === "remote" && !arg.includes("|")) return fail(400, "remote arg must be 'key|device name'");
     }
-    if (!(await withinLimit(db, device.id, "send", 30, 60000, now))) return fail(429, "more than 30 commands a minute");
+    if (!(await withinLimit(db, principal.rateKey, "send", 30, 60000, now))) return fail(429, "more than 30 commands a minute");
     const id = newId();
     await db
       .prepare("INSERT INTO commands (id, bridge_id, action, arg, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)")
@@ -542,6 +685,7 @@ async function handle(request, env) {
   }
 
   if (method === "GET" && path === "/state") {
+    if (!allowed(principal, ["ax"])) return forbidden(principal, "this credential may not read phone state");
     const rows = await db
       .prepare(
         `SELECT c.id, c.action, c.arg, c.status, c.created_at, r.output
