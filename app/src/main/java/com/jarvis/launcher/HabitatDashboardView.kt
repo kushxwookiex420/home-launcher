@@ -61,11 +61,13 @@ class HabitatDashboardView @JvmOverloads constructor(
         }
 
     private var ticking = false
-    private val ticker = object : Runnable {
+    private val ticker: Runnable = object : Runnable {
         override fun run() {
             ticking = false
-            if (expanded && isShown) refresh()
-            schedule()
+            if (polling()) {
+                refresh()
+                handler.postDelayed(this, REFRESH_MS)
+            }
         }
     }
 
@@ -91,7 +93,7 @@ class HabitatDashboardView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        schedule()
+        syncTicker()
     }
 
     override fun onDetachedFromWindow() {
@@ -101,9 +103,19 @@ class HabitatDashboardView @JvmOverloads constructor(
 
     // ---- chrome ------------------------------------------------------------
 
-    private fun schedule() {
+    /**
+     * Polling needs three real conditions, not a timer alone: expanded, attached and actually
+     * visible. Collapsed, backgrounded, or parked on another ViewPager page, it schedules nothing.
+     */
+    private fun polling(): Boolean = expanded && isAttachedToWindow && isShown
+
+    private fun syncTicker(refreshIfStale: Boolean = true) {
         handler.removeCallbacks(ticker)
-        if (!expanded) return
+        if (!polling()) return
+        if (refreshIfStale) {
+            val last = HabitatClient.lastSync(context)
+            if (last <= 0L || System.currentTimeMillis() - last >= REFRESH_MS) refresh()
+        }
         handler.postDelayed(ticker, REFRESH_MS)
     }
 
@@ -112,12 +124,13 @@ class HabitatDashboardView @JvmOverloads constructor(
         binding.habitatToggle.setText(if (expanded) R.string.habitat_close else R.string.habitat_open)
         binding.habitatLinkRow.visibility =
             if (!HabitatClient.isLinked(context) && expanded) View.VISIBLE else View.GONE
-        if (expanded) {
-            schedule()
-            if (isAttachedToWindow) refresh()
-        } else {
-            handler.removeCallbacks(ticker)
-        }
+        syncTicker()
+        if (expanded) HabitatNotifier.ensurePermission(context)
+    }
+
+    override fun onVisibilityAggregated(isVisible: Boolean) {
+        super.onVisibilityAggregated(isVisible)
+        if (isVisible) syncTicker() else handler.removeCallbacks(ticker)
     }
 
     private fun buildTabs() {
@@ -198,6 +211,7 @@ class HabitatDashboardView @JvmOverloads constructor(
                     binding.habitatError.visibility = View.GONE
                     paintChrome()
                     renderSection()
+                    HabitatNotifier.onSync(context, it)
                 }.onFailure {
                     payload = null
                     paintChrome()
@@ -225,10 +239,12 @@ class HabitatDashboardView @JvmOverloads constructor(
         )
         binding.habitatChip.setTextColor(color(if (online) R.color.cyan else R.color.text_dim))
         val last = HabitatClient.lastSync(context)
+        // A failed refresh still reports when the data was last accurate, rather than claiming it
+        // never synced. Nothing is shown as current unless the last call succeeded.
         val syncLine = when {
             !linked -> str(R.string.habitat_not_linked) + " · ID " + shortId()
-            data == null -> str(R.string.habitat_not_synced)
-            last > 0 -> str(R.string.habitat_synced) + " " + stamp.format(Date(last))
+            data != null && last > 0 -> str(R.string.habitat_synced) + " " + stamp.format(Date(last))
+            data == null && last > 0 -> str(R.string.habitat_last_sync_failed, stamp.format(Date(last)))
             else -> str(R.string.habitat_not_synced)
         }
         binding.habitatSync.text = syncLine
@@ -483,6 +499,13 @@ class HabitatDashboardView @JvmOverloads constructor(
                 str(R.string.habitat_providers) + " " +
                     (if (cloud.optJSONObject("providers")?.optBoolean("openRouter") == true) "OPENROUTER" else "OPENROUTER OFF") +
                     " · " + (if (cloud.optJSONObject("providers")?.optBoolean("relay") == true) "RELAY" else "RELAY OFF")
+            )
+        )
+        box.addView(
+            line(
+                str(R.string.habitat_notify) + " " +
+                    str(if (HabitatNotifier.enabled(context)) R.string.habitat_notify_on else R.string.habitat_notify_blocked),
+                if (HabitatNotifier.enabled(context)) color(R.color.cyan) else color(R.color.text_dim)
             )
         )
         val github = cloud.optJSONObject("github")
