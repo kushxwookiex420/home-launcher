@@ -1,0 +1,9 @@
+{
+  "name": "home-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Relay between a paired Android launcher, a coding agent and an outside assistant.",
+  "scripts": {
+    "test": "node test/run.mjs"
+  }
+}

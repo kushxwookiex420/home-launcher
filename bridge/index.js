@@ -2,6 +2,8 @@
 // and hands tasks to the coding agent. Nothing here executes anything on the phone — the launcher
 // decides, against its own whitelist in MainActivity.runBridgeCommand.
 
+import { OPENAPI } from "./openapi.js";
+
 const JSON_HEAD = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_FILE_CHARS = 200000;
 const CODE_RE = /^[A-Z0-9]{6}$/;
@@ -229,4 +231,342 @@ function parseArtifacts(raw) {
   } catch {
     return [];
   }
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (error) {
+      const message = String((error && error.message) || error);
+      return fail(500, message, "internal");
+    }
+  }
+};
+
+async function handle(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const method = request.method;
+
+  if (method === "GET" && path === "/health") {
+    try {
+      await ensureSchema(env);
+      return json({ ok: true, db: !!env.DB });
+    } catch (error) {
+      return fail(500, String((error && error.message) || error), "db");
+    }
+  }
+
+  if (method === "GET" && path === "/openapi.json") return json(OPENAPI);
+
+  if (method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEAD });
+
+  await ensureSchema(env);
+  const db = env.DB;
+  const now = Date.now();
+  const parsed = method === "POST" ? await readBody(request) : { body: {}, ok: true };
+  if (method === "POST" && !parsed.ok) return fail(400, "invalid json");
+
+  // ---- phone endpoints (unchanged contract: the sideloaded APK talks to these) ----
+
+  if (method === "POST" && path === "/bridge") {
+    const body = parsed.body;
+    const id = newId();
+    let code = code6();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const clash = await db.prepare("SELECT id FROM bridges WHERE code = ?").bind(code).first();
+      if (!clash) break;
+      code = code6();
+    }
+    await db
+      .prepare("INSERT INTO bridges (id, code, name, created_at, last_seen) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, code, cleanStr(body.name, 40) || "phone", now, now)
+      .run();
+    return json({ id, code });
+  }
+
+  if (method === "POST" && path === "/poll") {
+    const body = parsed.body;
+    const bridge = await db
+      .prepare("SELECT id FROM bridges WHERE id = ? AND code = ?")
+      .bind(cleanStr(body.id, 60), String(body.code || "").trim().toUpperCase())
+      .first();
+    if (!bridge) return fail(404, "unknown bridge");
+    await db.prepare("UPDATE bridges SET last_seen = ? WHERE id = ?").bind(now, bridge.id).run();
+    const command = await db
+      .prepare("SELECT id, action, arg FROM commands WHERE bridge_id = ? AND status = 'pending' ORDER BY created_at LIMIT 1")
+      .bind(bridge.id)
+      .first();
+    if (!command) return json({ command: null });
+    await db.prepare("UPDATE commands SET status = 'taken' WHERE id = ?").bind(command.id).run();
+    return json({ command });
+  }
+
+  if (method === "POST" && path === "/result") {
+    const body = parsed.body;
+    const bridge = await db
+      .prepare("SELECT id FROM bridges WHERE id = ? AND code = ?")
+      .bind(cleanStr(body.id, 60), String(body.code || "").trim().toUpperCase())
+      .first();
+    if (!bridge) return fail(404, "unknown bridge");
+    const commandId = cleanStr(body.commandId, 60);
+    if (!commandId) return fail(400, "commandId required");
+    await db.prepare("UPDATE commands SET status = 'done' WHERE id = ? AND bridge_id = ?").bind(commandId, bridge.id).run();
+    await db
+      .prepare("INSERT INTO results (id, bridge_id, command_id, output, created_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(newId(), bridge.id, commandId, cleanStr(body.output, 800), now)
+      .run();
+    return json({ ok: true });
+  }
+
+  // ---- authenticated endpoints ----
+
+  const auth = await authDevice(request, env, url, parsed.body);
+  if (auth.error) return auth.error;
+  const device = auth.device;
+
+  if (method === "POST" && path === "/note") {
+    const body = parsed.body;
+    const text = cleanStr(body.text, 4000);
+    if (!text) return fail(400, "text required");
+    if (!(await withinLimit(db, device.id, "note", 20, 60000, now))) return fail(429, "more than 20 tasks a minute");
+    const taskId = newId();
+    await db
+      .prepare("INSERT INTO notes (id, bridge_id, source, text, ack, created_at, done, title) VALUES (?, ?, ?, ?, 0, ?, 0, ?)")
+      .bind(taskId, device.id, cleanStr(body.source, 40) || "chatgpt", text, now, cleanStr(body.title, 120) || null)
+      .run();
+    return json({ ok: true, taskId, createdAt: now, iso: iso(now) });
+  }
+
+  if (method === "GET" && path === "/notes") {
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
+    const rows = await db
+      .prepare("SELECT id, source, text, title, ack, done, created_at FROM notes WHERE bridge_id = ? AND ack = 0 ORDER BY created_at LIMIT ?")
+      .bind(device.id, limit)
+      .all();
+    const tasks = (rows.results || []).map((row) => ({
+      id: row.id,
+      text: row.text,
+      title: row.title || undefined,
+      source: row.source,
+      status: noteStatus(row),
+      createdAt: row.created_at,
+      created_at: row.created_at,
+      iso: iso(row.created_at)
+    }));
+    return json({ ok: true, count: tasks.length, tasks, notes: tasks });
+  }
+
+  if (method === "POST" && path === "/notes/ack") {
+    const body = parsed.body;
+    const ids = Array.isArray(body.ids) ? body.ids.map((id) => cleanStr(id, 60)).filter(Boolean).slice(0, 50) : [];
+    if (ids.length) {
+      for (const id of ids) {
+        await db.prepare("UPDATE notes SET ack = 1 WHERE bridge_id = ? AND id = ?").bind(device.id, id).run();
+      }
+      return json({ ok: true, acknowledged: ids.length });
+    }
+    await db.prepare("UPDATE notes SET ack = 1 WHERE bridge_id = ? AND ack = 0").bind(device.id).run();
+    return json({ ok: true, acknowledged: "all" });
+  }
+
+  if (method === "GET" && path === "/tasks") {
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
+    const rows = await db
+      .prepare(
+        `SELECT n.id, n.text, n.title, n.source, n.ack, n.done, n.created_at,
+                r.id AS reply_id, r.artifacts
+           FROM notes n
+           LEFT JOIN replies r ON r.task_id = n.id
+          WHERE n.bridge_id = ?
+          ORDER BY n.created_at DESC
+          LIMIT ?`
+      )
+      .bind(device.id, limit)
+      .all();
+    const tasks = (rows.results || []).map((row) => ({
+      id: row.id,
+      text: row.text,
+      title: row.title || undefined,
+      source: row.source,
+      status: noteStatus(row),
+      createdAt: row.created_at,
+      iso: iso(row.created_at),
+      replyId: row.reply_id || undefined,
+      artifacts: parseArtifacts(row.artifacts)
+    }));
+    return json({ ok: true, count: tasks.length, tasks });
+  }
+
+  if (method === "POST" && path === "/reply") {
+    const body = parsed.body;
+    const text = cleanStr(body.text, 4000);
+    if (!text) return fail(400, "text required");
+    const taskId = cleanStr(body.taskId, 60);
+    if (taskId) {
+      const task = await db
+        .prepare("SELECT id FROM notes WHERE bridge_id = ? AND id = ?")
+        .bind(device.id, taskId)
+        .first();
+      if (!task) return fail(400, "unknown taskId");
+    }
+    const artifacts = Array.isArray(body.artifacts) ? body.artifacts : [];
+    if (artifacts.length > 10) return fail(400, "at most 10 artifacts");
+    const cleanArtifacts = [];
+    for (const item of artifacts) {
+      const link = cleanStr(item, 300);
+      if (!/^https?:\/\//i.test(link)) return fail(400, "artifacts must be http(s) links");
+      cleanArtifacts.push(link);
+    }
+    if (!(await withinLimit(db, device.id, "reply", 60, 60000, now))) return fail(429, "rate limited");
+    const replyId = newId();
+    await db
+      .prepare("INSERT INTO replies (id, bridge_id, source, text, created_at, task_id, artifacts) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(replyId, device.id, cleanStr(body.source, 40) || "freebuff", text, now, taskId || null, JSON.stringify(cleanArtifacts))
+      .run();
+    if (taskId) {
+      await db.prepare("UPDATE notes SET ack = 1, done = 1 WHERE bridge_id = ? AND id = ?").bind(device.id, taskId).run();
+    }
+    return json({ ok: true, replyId, taskId: taskId || undefined, createdAt: now, iso: iso(now) });
+  }
+
+  if (method === "GET" && path === "/replies") {
+    const since = Number(url.searchParams.get("since") || 0) || 0;
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
+    const taskId = cleanStr(url.searchParams.get("taskId"), 60);
+    const rows = taskId
+      ? await db
+          .prepare("SELECT id, task_id, source, text, artifacts, created_at FROM replies WHERE bridge_id = ? AND created_at > ? AND task_id = ? ORDER BY created_at LIMIT ?")
+          .bind(device.id, since, taskId, limit)
+          .all()
+      : await db
+          .prepare("SELECT id, task_id, source, text, artifacts, created_at FROM replies WHERE bridge_id = ? AND created_at > ? ORDER BY created_at LIMIT ?")
+          .bind(device.id, since, limit)
+          .all();
+    const replies = (rows.results || []).map((row) => ({
+      id: row.id,
+      taskId: row.task_id || null,
+      source: row.source,
+      text: row.text,
+      artifacts: parseArtifacts(row.artifacts),
+      createdAt: row.created_at,
+      created_at: row.created_at,
+      iso: iso(row.created_at)
+    }));
+    return json({ ok: true, count: replies.length, serverTime: now, replies });
+  }
+
+  if (method === "POST" && path === "/files") {
+    const body = parsed.body;
+    const nameProblem = badFileName(body.name);
+    if (nameProblem) return fail(400, nameProblem);
+    const name = String(body.name).trim();
+    if (typeof body.content !== "string") return fail(400, "content must be a string");
+    const content = body.content;
+    if (!content.length) return fail(400, "content required");
+    if (content.length > MAX_FILE_CHARS) return fail(413, `file too large (${MAX_FILE_CHARS} characters)`);
+    if (!(await withinLimit(db, device.id, "files", 60, 60000, now))) return fail(429, "rate limited");
+    const encoding = body.encoding === "base64" ? "base64" : "text";
+    const bytes = new TextEncoder().encode(content).length;
+    const hash = await sha256(content);
+    await db.prepare("DELETE FROM files WHERE bridge_id = ? AND name = ?").bind(device.id, name).run();
+    await db
+      .prepare("INSERT INTO files (id, bridge_id, name, mime, data, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(newId(), device.id, name, cleanStr(body.mime, 60) || "text/plain", content, encoding, now)
+      .run();
+    return json({ ok: true, name, bytes, sha256: hash, updatedAt: now, iso: iso(now) });
+  }
+
+  if (method === "GET" && path === "/files") {
+    const rows = await db
+      .prepare("SELECT name, mime, encoding, length(data) AS size, created_at FROM files WHERE bridge_id = ? ORDER BY created_at DESC")
+      .bind(device.id)
+      .all();
+    const files = (rows.results || []).map((row) => ({
+      name: row.name,
+      mime: row.mime,
+      encoding: row.encoding,
+      size: row.size,
+      bytes: row.size,
+      updatedAt: row.created_at,
+      iso: iso(row.created_at)
+    }));
+    return json({ ok: true, count: files.length, files });
+  }
+
+  if (method === "GET" && path === "/file") {
+    const rawName = url.searchParams.get("name");
+    const nameProblem = badFileName(rawName);
+    if (nameProblem) return fail(400, nameProblem);
+    const row = await db
+      .prepare("SELECT name, mime, data, encoding, created_at FROM files WHERE bridge_id = ? AND name = ?")
+      .bind(device.id, String(rawName).trim())
+      .first();
+    if (!row) return fail(404, "no such file");
+    return json({
+      ok: true,
+      name: row.name,
+      mime: row.mime,
+      encoding: row.encoding,
+      size: row.data.length,
+      updatedAt: row.created_at,
+      iso: iso(row.created_at),
+      data: row.data
+    });
+  }
+
+  if (method === "POST" && path === "/send") {
+    const body = parsed.body;
+    const action = cleanStr(body.action, 40);
+    const spec = ACTIONS[action];
+    if (!spec) return fail(400, `unknown action (allowed: ${Object.keys(ACTIONS).join(", ")})`);
+    let arg = cleanStr(body.arg, spec.max || 60);
+    if (spec.arg === "none") {
+      arg = "";
+    } else if (spec.arg === "one") {
+      arg = arg.toLowerCase();
+      if (!spec.values.includes(arg)) return fail(400, `arg must be one of ${spec.values.join(", ")}`);
+    } else if (spec.arg === "text") {
+      if (!arg) return fail(400, "arg required for this action");
+      if (action === "url" && !/^https:\/\//i.test(arg)) return fail(400, "url must start with https://");
+      if (action === "remote" && !arg.includes("|")) return fail(400, "remote arg must be 'key|device name'");
+    }
+    if (!(await withinLimit(db, device.id, "send", 30, 60000, now))) return fail(429, "more than 30 commands a minute");
+    const id = newId();
+    await db
+      .prepare("INSERT INTO commands (id, bridge_id, action, arg, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)")
+      .bind(id, device.id, action, arg, now)
+      .run();
+    return json({ ok: true, id, action, arg, queuedAt: now, iso: iso(now) });
+  }
+
+  if (method === "GET" && path === "/state") {
+    const rows = await db
+      .prepare(
+        `SELECT c.id, c.action, c.arg, c.status, c.created_at, r.output
+           FROM commands c LEFT JOIN results r ON r.command_id = c.id
+          WHERE c.bridge_id = ? ORDER BY c.created_at DESC LIMIT 10`
+      )
+      .bind(device.id)
+      .all();
+    return json({
+      ok: true,
+      name: device.name,
+      lastSeen: device.last_seen,
+      online: !!(device.last_seen && now - device.last_seen < 45000),
+      serverTime: now,
+      commands: (rows.results || []).map((row) => ({
+        id: row.id,
+        action: row.action,
+        arg: row.arg,
+        status: row.status,
+        output: row.output || null,
+        createdAt: row.created_at,
+        iso: iso(row.created_at)
+      }))
+    });
+  }
+
+  return fail(404, `no route for ${method} ${path}`);
 }
