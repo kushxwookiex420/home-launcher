@@ -13,12 +13,26 @@ const RAW = {
     title: "Home Bridge",
     description:
       "Bridge between an outside assistant (a ChatGPT custom action) and a paired Android launcher plus its coding agent. Call POST /note to hand work to the agent, GET /replies to read results, and the shared-folder operations to inspect project files. Phone actions are limited to the relay whitelist and are still re-validated on the device.",
-    version: "1.2.0"
+    version: "1.3.0"
   },
   servers: [{ url: "https://home-bridge-qn2hnd-preview.freebuff.site" }],
-  security: [{ pairingCode: [] }],
+  security: [{ axToken: [] }, { buffToken: [] }, { pairingCode: [] }],
   components: {
     securitySchemes: {
+      axToken: {
+        type: "http",
+        scheme: "bearer",
+        bearerFormat: "hb_ax_<48 hex>",
+        description:
+          "Ax assistant credential. Can submit tasks, read task status and replies, read shared files, queue approved phone actions and read phone state. Cannot post replies, upload files, claim tasks or mint credentials."
+      },
+      buffToken: {
+        type: "http",
+        scheme: "bearer",
+        bearerFormat: "hb_buff_<48 hex>",
+        description:
+          "Buff agent credential. Can read and claim the task queue, post replies, upload and update shared files and read files. Cannot submit tasks, queue phone actions or read phone state."
+      },
       pairingCode: {
         type: "apiKey",
         in: "query",
@@ -76,6 +90,90 @@ const RAW = {
     }
   },
   paths: {
+    "/keys": {
+      get: {
+        operationId: "listCredentials",
+        summary: "List credentials (owner only)",
+        description:
+          "Metadata for every credential of this phone: id, role, label, prefix, creation, expiry, revocation and last use. Tokens themselves are never returned.",
+        responses: {
+          200: { description: "Credentials without secrets" },
+          401: errResponse("Unauthorized"),
+          403: errResponse("Only the owner pairing code may list credentials")
+        }
+      },
+      post: {
+        operationId: "mintCredential",
+        summary: "Mint an ax or buff credential (owner only)",
+        description:
+          "Returns the token once; only its SHA-256 hash is stored. Use ttlDays for automatic expiry. Revoke with /keys/revoke.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  code: { type: "string", description: "Owner pairing code, or send it as a Bearer token." },
+                  role: { type: "string", enum: ["ax", "buff"] },
+                  label: { type: "string", maxLength: 60 },
+                  ttlDays: { type: "integer", minimum: 1, maximum: 365 }
+                },
+                required: ["role"]
+              }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: "Created",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    ok: { type: "boolean" },
+                    id: { type: "string" },
+                    role: { type: "string" },
+                    token: { type: "string", description: "Shown once." },
+                    expiresAt: { type: "number" }
+                  }
+                }
+              }
+            }
+          },
+          400: errResponse("Bad role or ttl"),
+          401: errResponse("Unauthorized"),
+          403: errResponse("A role credential cannot mint credentials")
+        }
+      }
+    },
+    "/keys/revoke": {
+      post: {
+        operationId: "revokeCredential",
+        summary: "Revoke a credential (owner only)",
+        description: "Sets revokedAt; the token stops working on the next request. Create a replacement first if you are rotating.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: { code: { type: "string" }, id: { type: "string" } },
+                required: ["id"]
+              }
+            }
+          }
+        },
+        responses: {
+          200: { description: "Revoked" },
+          400: errResponse("Missing id"),
+          401: errResponse("Unauthorized"),
+          403: errResponse("A role credential cannot revoke credentials"),
+          404: errResponse("No such credential")
+        }
+      }
+    },
     "/note": {
       post: {
         operationId: "handTaskToAgent",
